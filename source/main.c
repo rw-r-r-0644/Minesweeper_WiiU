@@ -1,17 +1,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <dirent.h>
-
-#include <switch.h>
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_events.h>
 #include <SDL2/SDL_image.h>
 #include <SDL2/SDL_ttf.h>
-#include <SDL2/SDL_mixer.h>
+
+#include <whb/proc.h>
+#include <vpad/input.h>
 
 #define TILE_SIZEX 48
 #define TILE_SIZEY 48
@@ -20,8 +21,17 @@
 #define FLAG 10
 #define BOMBE 11
 
-#define SAVEPATH "sdmc:/switch/Minesweeper_NX/"
+#define SAVEPATH "fs:/vol/external01/wiiu/apps/Minesweeper_WiiU/"
 #define SAVEFILE "mineswpr.dat"
+
+#define EXT_RES_FILE(name, ext)	extern char _binary_resources_##name##_##ext##_start[]; \
+								extern char _binary_resources_##name##_##ext##_size[];
+#define RES_DATA(name, ext)		_binary_resources_##name##_##ext##_start
+#define RES_SIZE(name, ext)		(int)_binary_resources_##name##_##ext##_size
+
+EXT_RES_FILE(BG_BOTTOM_CUSTOM,png)	EXT_RES_FILE(CURSOR,png)		EXT_RES_FILE(NUMBERS,png)
+EXT_RES_FILE(BG_BOTTOM_GAME,png)	EXT_RES_FILE(EMOTICONS,png)	EXT_RES_FILE(SELECTOR,png)
+EXT_RES_FILE(BG_BOTTOM_MENU,png)	EXT_RES_FILE(NUMBER,png)		EXT_RES_FILE(TILES,png)
 
 char filename[41]; // strlen(SAVEPATH) + strlen(SAVEFILE) + 1 = 41
 const char* savepath;
@@ -30,14 +40,19 @@ SDL_Window * 	window;
 SDL_Renderer * 	renderer;
 SDL_Surface *	surface;
 
-u8 CASE_X, CASE_Y;
-u8 TILE_X, TILE_Y;
+uint8_t CASE_X, CASE_Y;
+uint8_t TILE_X, TILE_Y;
 
-touchPosition Stylus;
+VPADTouchData Stylus;
+enum {
+	STYLUS_DOWN = (1 << 0),
+	STYLUS_HELD = (1 << 1),
+	STYLUS_UP = (1 << 2),
+} StylusState = 0;
 
-u32 kDown;
-u32 kHeld;
-u32 kUp;
+uint32_t kDown;
+uint32_t kHeld;
+uint32_t kUp;
 
 bool Timer;
 bool game_over;
@@ -49,31 +64,31 @@ bool game;
 bool anim;
 bool custom_wait_touch;
 bool data_changed;
-u16 timing;
-s16 chrono;
-u16 highscore[3];
-u8 customX;
-u8 customY;
+uint16_t timing;
+int16_t chrono;
+uint16_t highscore[3];
+uint8_t customX;
+uint8_t customY;
 int customM;
 
-u8 MAX_TILEX;//19
-u8 MAX_TILEY;//14
+uint8_t MAX_TILEX;//19
+uint8_t MAX_TILEY;//14
 
-u16 level_courant[19*14];
-u16 level_courant_cache[19*14];
+uint16_t level_courant[19*14];
+uint16_t level_courant_cache[19*14];
 
 int nbr_mines;
 int total_mines;
 
-u16 mines_restante;
-u16 cases_ouvertes;
+uint16_t mines_restante;
+uint16_t cases_ouvertes;
 
-u8 colonnes, lignes;
+uint8_t colonnes, lignes;
 
-u8 frame;
+uint8_t frame;
 
-u8 selector;
-u8 saved_selector;
+uint8_t selector;
+uint8_t saved_selector;
 int newselector;
 
 int tempsPrecedent;
@@ -87,6 +102,15 @@ typedef struct
 } 
 images;
 images tile, background[5], sprite[2], smiley, chiffre, number;
+
+SDL_Texture *LoadImageTexture(void *image, int size)
+{
+	SDL_RWops *memrw = SDL_RWFromMem(image, size);
+	SDL_Surface *surface = IMG_Load_RW(memrw, 1);
+	SDL_Texture *ret = SDL_CreateTextureFromSurface(renderer, surface);
+	SDL_FreeSurface(surface);
+	return ret;
+}
 
 void renderTexture(SDL_Texture *tex, SDL_Renderer *ren, int Srcx, int Srcy, int Destx, int Desty, int w, int h)
 {
@@ -117,10 +141,10 @@ void draw_rectangle(int positionX, int positionY, int tailleX, int tailleY)
 }
 
 //TOUCH
-bool inBox(touchPosition touch, int x1, int y1, int x2, int y2)
+bool inBox(VPADTouchData touch, int x1, int y1, int x2, int y2)
 {
-	int tx=touch.px;
-	int ty=touch.py;
+	int tx=touch.x;
+	int ty=touch.y;
 
 	if (tx > x1 && tx < x2 && ty > y1 && ty < y2)
 	{
@@ -132,12 +156,12 @@ bool inBox(touchPosition touch, int x1, int y1, int x2, int y2)
 	}
 }
 
-bool HeldtouchInBox(touchPosition touch, int x1, int y1, int x2, int y2)
+bool HeldtouchInBox(VPADTouchData touch, int x1, int y1, int x2, int y2)
 {
-	int tx=touch.px;
-	int ty=touch.py;
+	int tx=touch.x;
+	int ty=touch.y;
 
-	if (kHeld & KEY_TOUCH && tx > x1 && tx < x2 && ty > y1 && ty < y2)
+	if ((StylusState & STYLUS_HELD) && tx > x1 && tx < x2 && ty > y1 && ty < y2)
 	{
 		return true;
 	}
@@ -188,9 +212,9 @@ void rippleUncover(int rowClicked, int columnClicked)
 
 void uncoverGameOver() {
 	//On ouvre toutes les bombes non ouverte
-	for(u8 lignes = 0; lignes < MAX_TILEX; lignes++)
+	for(uint8_t lignes = 0; lignes < MAX_TILEX; lignes++)
 	{
-		for(u8 colonnes = 0; colonnes < MAX_TILEY; colonnes++)
+		for(uint8_t colonnes = 0; colonnes < MAX_TILEY; colonnes++)
 		{
 			if ((level_courant[lignes*MAX_TILEY + colonnes] == BOMBE)
 				&& (level_courant_cache[lignes*MAX_TILEY + colonnes] != FLAG))
@@ -214,11 +238,11 @@ void uncoverNeighbours(int rowClicked, int columnClicked)
 	}
 
 	// test whether the number of flags on neighbours matches the current cell's value
-	u8 flags = 0;
+	uint8_t flags = 0;
 
-	for (u8 i=(rowClicked>0?rowClicked-1:0); i <= rowClicked+1 && i<MAX_TILEX; i++)
+	for (uint8_t i=(rowClicked>0?rowClicked-1:0); i <= rowClicked+1 && i<MAX_TILEX; i++)
 	{
-		for (u8 j=(columnClicked>0?columnClicked-1:0); j <= columnClicked+1 && j<MAX_TILEY; j++)
+		for (uint8_t j=(columnClicked>0?columnClicked-1:0); j <= columnClicked+1 && j<MAX_TILEY; j++)
 		{
 			if (level_courant_cache[i*MAX_TILEY + j] == FLAG)
 			{
@@ -232,9 +256,9 @@ void uncoverNeighbours(int rowClicked, int columnClicked)
 	}
 
 	// open neighbour cells
-	for (u8 i=(rowClicked>0?rowClicked-1:0); i <= rowClicked+1 && i<MAX_TILEX; i++)
+	for (uint8_t i=(rowClicked>0?rowClicked-1:0); i <= rowClicked+1 && i<MAX_TILEX; i++)
 	{
-		for (u8 j=(columnClicked>0?columnClicked-1:0); j <= columnClicked+1 && j<MAX_TILEY; j++)
+		for (uint8_t j=(columnClicked>0?columnClicked-1:0); j <= columnClicked+1 && j<MAX_TILEY; j++)
 		{
 			if (level_courant_cache[i*MAX_TILEY + j] == 16 ||
 				level_courant_cache[i*MAX_TILEY + j] == FLAG)
@@ -264,11 +288,11 @@ void uncoverNeighbours(int rowClicked, int columnClicked)
 	return;
 }
 
-void Affiche_trois_chiffres(u16 valeur, u16 posx, u16 posy)
+void Affiche_trois_chiffres(uint16_t valeur, uint16_t posx, uint16_t posy)
 {
-	u8 unite = 0;
-	u8 dizaine = 0;
-	u16 centaine = 0;
+	uint8_t unite = 0;
+	uint8_t dizaine = 0;
+	uint16_t centaine = 0;
 
 	if (valeur < 10)
 	{
@@ -294,11 +318,11 @@ void Affiche_trois_chiffres(u16 valeur, u16 posx, u16 posy)
 	renderTexture(chiffre.texture, renderer, unite*78, 0, posx+156, posy, 78, 138);
 }
 
-void Affiche_nombre(u16 valeur, u16 posx, u16 posy)
+void Affiche_nombre(uint16_t valeur, uint16_t posx, uint16_t posy)
 {
-	u8 unite;
-	u8 dizaine;
-	u16 centaine;
+	uint8_t unite;
+	uint8_t dizaine;
+	uint16_t centaine;
 
 	if (valeur < 10)
 	{
@@ -329,14 +353,14 @@ void Affiche_nombre(u16 valeur, u16 posx, u16 posy)
 	}
 }
 
-void update_level_courant(u8 lignes, u8 colonnes) {
+void update_level_courant(uint8_t lignes, uint8_t colonnes) {
 	if (level_courant[colonnes + lignes*MAX_TILEY] != BOMBE)
 	{
 		level_courant[colonnes + lignes*MAX_TILEY] = 0;
 
-		for (u8 i=(lignes>0?lignes-1:0); i <= lignes+1 && i<MAX_TILEX; i++)
+		for (uint8_t i=(lignes>0?lignes-1:0); i <= lignes+1 && i<MAX_TILEX; i++)
 		{
-			for (u8 j=(colonnes>0?colonnes-1:0); j <= colonnes+1 && j<MAX_TILEY; j++)
+			for (uint8_t j=(colonnes>0?colonnes-1:0); j <= colonnes+1 && j<MAX_TILEY; j++)
 			{
 				if (level_courant[j + i*MAX_TILEY] == BOMBE)
 				{
@@ -384,9 +408,9 @@ void Restart_Game()
 	tempsActuel = 0;
 
 	//On nettoi
-	for(u8 lignes = 0; lignes < MAX_TILEX; lignes++)
+	for(uint8_t lignes = 0; lignes < MAX_TILEX; lignes++)
 	{
-		for(u8 colonnes = 0; colonnes < MAX_TILEY; colonnes++)
+		for(uint8_t colonnes = 0; colonnes < MAX_TILEY; colonnes++)
 		{
 			level_courant[colonnes + lignes*MAX_TILEY] = 0;
 
@@ -502,12 +526,12 @@ void manageInput()
 {
 	if (mode_title)
 	{
-		if (kDown & KEY_DOWN)
+		if (kDown & VPAD_BUTTON_DOWN)
 		{
 			selector++;
 			selector %= 4;
 		}
-		else if (kDown & KEY_UP)
+		else if (kDown & VPAD_BUTTON_UP)
 		{
 			if (selector > 0)
 			{
@@ -518,14 +542,14 @@ void manageInput()
 				selector = 3;
 			}
 		}
-		else if ((kUp & KEY_A) && (selector < 3))
+		else if ((kUp & VPAD_BUTTON_A) && (selector < 3))
 		{
 			mode_title = false;
 			mode_game = true;
 
 			Restart_Game();
 		}
-		else if ((kUp & KEY_A) && (selector == 3))
+		else if ((kUp & VPAD_BUTTON_A) && (selector == 3))
 		{
 			mode_title = false;
 			mode_custom = true;
@@ -535,9 +559,9 @@ void manageInput()
 			custom_wait_touch = true;
 		}
 		
-		if (kDown & KEY_TOUCH)
+		if (StylusState & STYLUS_DOWN)
 		{
-			u8 newselector;
+			uint8_t newselector;
 			if (inBox(Stylus, 526, 108, 753, 182))//EASY
 			{
 				newselector = 0;
@@ -608,20 +632,20 @@ void manageInput()
 	}
 	else if (mode_game)
 	{
-		if ((kDown & KEY_UP) && (CASE_Y > 0)) CASE_Y--;
-		else if ((kDown & KEY_DOWN) && (CASE_Y < MAX_TILEY-1)) CASE_Y++;
-		else if ((kDown & KEY_RIGHT) && (CASE_X < MAX_TILEX-1)) CASE_X++;
-		else if ((kDown & KEY_LEFT) && (CASE_X > 0)) CASE_X--;
+		if ((kDown & VPAD_BUTTON_UP) && (CASE_Y > 0)) CASE_Y--;
+		else if ((kDown & VPAD_BUTTON_DOWN) && (CASE_Y < MAX_TILEY-1)) CASE_Y++;
+		else if ((kDown & VPAD_BUTTON_RIGHT) && (CASE_X < MAX_TILEX-1)) CASE_X++;
+		else if ((kDown & VPAD_BUTTON_LEFT) && (CASE_X > 0)) CASE_X--;
 
-		if ((kDown & KEY_TOUCH) && (inBox(Stylus, 320+(960-(MAX_TILEX*TILE_SIZEX))/2, (720-(MAX_TILEY*TILE_SIZEY))/2, 320+(960-(MAX_TILEX*TILE_SIZEX))/2 + MAX_TILEX*TILE_SIZEX, (720-(MAX_TILEY*TILE_SIZEY))/2 + MAX_TILEY*TILE_SIZEY)) && (!game_over))
+		if ((StylusState & STYLUS_DOWN) && (inBox(Stylus, 320+(960-(MAX_TILEX*TILE_SIZEX))/2, (720-(MAX_TILEY*TILE_SIZEY))/2, 320+(960-(MAX_TILEX*TILE_SIZEX))/2 + MAX_TILEX*TILE_SIZEX, (720-(MAX_TILEY*TILE_SIZEY))/2 + MAX_TILEY*TILE_SIZEY)) && (!game_over))
 		{
-			CASE_X = (Stylus.px-320-(960-(MAX_TILEX*TILE_SIZEX))/2)/TILE_SIZEX;
-			CASE_Y = (Stylus.py-(720-(MAX_TILEY*TILE_SIZEY))/2)/TILE_SIZEY;
+			CASE_X = (Stylus.x-320-(960-(MAX_TILEX*TILE_SIZEX))/2)/TILE_SIZEX;
+			CASE_Y = (Stylus.y-(720-(MAX_TILEY*TILE_SIZEY))/2)/TILE_SIZEY;
 			
-			kDown |= KEY_A;
+			kDown |= VPAD_BUTTON_A;
 		}
 
-		if ((kDown & KEY_A) && (!game_over))
+		if ((kDown & VPAD_BUTTON_A) && (!game_over))
 		{
 			game = true;
 			Timer = true;
@@ -630,12 +654,12 @@ void manageInput()
 			{
 				frame = 2;
 			}
-			if (kHeld & (KEY_L | KEY_R)) // modifier
+			if (kHeld & (VPAD_BUTTON_L | VPAD_BUTTON_R)) // modifier
 			{
 				timing = 5;
 			}
 		}
-		if (kDown & KEY_X && level_courant_cache[CASE_X*MAX_TILEY + CASE_Y] == CACHER)
+		if (kDown & VPAD_BUTTON_X && level_courant_cache[CASE_X*MAX_TILEY + CASE_Y] == CACHER)
 		{
 			game = true;
 			Timer = true;
@@ -658,7 +682,7 @@ void manageInput()
 				}
 			}
 
-			if ((kUp & KEY_TOUCH) || (kUp & KEY_A) || ((kUp & KEY_X) && timing >= 5))
+			if ((StylusState & STYLUS_UP) || (kUp & VPAD_BUTTON_A) || ((kUp & VPAD_BUTTON_X) && timing >= 5))
 			{
 				if (timing < 5)//Plus long et c'est le flag
 				{
@@ -669,8 +693,8 @@ void manageInput()
 
 						while(nbr_mines != total_mines)
 						{
-							u8 colonnes = rand() % MAX_TILEY;
-							u8 lignes = rand() % MAX_TILEX;
+							uint8_t colonnes = rand() % MAX_TILEY;
+							uint8_t lignes = rand() % MAX_TILEX;
 					
 							if (level_courant[lignes*MAX_TILEY + colonnes] != BOMBE && (lignes != CASE_X || colonnes != CASE_Y))
 							{
@@ -680,9 +704,9 @@ void manageInput()
 						}
 
 						//Pour chaque tile on compte le nombre de bombe voisine
-						for(u8 lignes = 0; lignes < MAX_TILEX; lignes++)
+						for(uint8_t lignes = 0; lignes < MAX_TILEX; lignes++)
 						{
-							for(u8 colonnes = 0; colonnes < MAX_TILEY; colonnes++)
+							for(uint8_t colonnes = 0; colonnes < MAX_TILEY; colonnes++)
 							{
 								update_level_courant(lignes, colonnes);
 					
@@ -750,9 +774,9 @@ void manageInput()
 			game_over = true;
 			game = false;
 
-			for(u8 lignes = 0; lignes < MAX_TILEX; lignes++)
+			for(uint8_t lignes = 0; lignes < MAX_TILEX; lignes++)
 			{
-				for(u8 colonnes = 0; colonnes < MAX_TILEY; colonnes++)
+				for(uint8_t colonnes = 0; colonnes < MAX_TILEY; colonnes++)
 				{
 					if ((level_courant[lignes*MAX_TILEY + colonnes] == BOMBE))
 					{
@@ -773,19 +797,19 @@ void manageInput()
 			}
 		}
 
-		if ((kHeld & (KEY_MINUS | KEY_Y)) || (game_over && kDown & (KEY_A | KEY_X | KEY_TOUCH)) || (game_over && anim && kHeld & (KEY_A | KEY_X | KEY_TOUCH)))
+		if ((kHeld & (VPAD_BUTTON_MINUS | VPAD_BUTTON_Y)) || (game_over && (kDown & (VPAD_BUTTON_A | VPAD_BUTTON_X) || (StylusState & STYLUS_DOWN))) || (game_over && anim && (kHeld & (VPAD_BUTTON_A | VPAD_BUTTON_X) || (StylusState & STYLUS_HELD))))
 		{
 			frame = 1;
 			anim = true;
 		}
 
-		if (((kUp & (KEY_MINUS | KEY_Y)) || (game_over && kUp & (KEY_A | KEY_X | KEY_TOUCH))) && anim && !(kHeld & (KEY_MINUS | KEY_Y) || (game_over && kDown & (KEY_A | KEY_X | KEY_TOUCH)) || (game_over && anim && kHeld & (KEY_A | KEY_X | KEY_TOUCH))))
+		if (((kUp & (VPAD_BUTTON_MINUS | VPAD_BUTTON_Y)) || (game_over && (kUp & (VPAD_BUTTON_A | VPAD_BUTTON_X) || (StylusState & STYLUS_UP)))) && anim && !(kHeld & (VPAD_BUTTON_MINUS | VPAD_BUTTON_Y) || (game_over && (kDown & (VPAD_BUTTON_A | VPAD_BUTTON_X) || (StylusState & STYLUS_DOWN))) || (game_over && anim && (kHeld & (VPAD_BUTTON_A | VPAD_BUTTON_X) || (StylusState & STYLUS_HELD)))))
 		{
 			anim = false;
 			Restart_Game();
 		}
 
-		if (kDown & (KEY_B))
+		if (kDown & (VPAD_BUTTON_B))
 		{
 			mode_title = true;
 			mode_game = false;
@@ -793,38 +817,38 @@ void manageInput()
 	}
 	else if (mode_custom)
 	{
-		if (kDown & (KEY_B))
+		if (kDown & (VPAD_BUTTON_B))
 		{
 			mode_title = true;
 			mode_custom = false;
 		}
-		else if ((kDown & KEY_UP) && (MAX_TILEY < 14)) MAX_TILEY++;
-		else if ((kDown & KEY_DOWN) && (MAX_TILEY > 2)) MAX_TILEY--;
-		else if ((kDown & KEY_RIGHT) && (MAX_TILEX < 19)) MAX_TILEX++;
-		else if ((kDown & KEY_LEFT) && (MAX_TILEX > 2)) MAX_TILEX--;
-		else if ((kDown & KEY_R) && (total_mines < MAX_TILEX*MAX_TILEY-1)) total_mines++;
-		else if ((kDown & KEY_L) && (total_mines > 1)) total_mines--;
+		else if ((kDown & VPAD_BUTTON_UP) && (MAX_TILEY < 14)) MAX_TILEY++;
+		else if ((kDown & VPAD_BUTTON_DOWN) && (MAX_TILEY > 2)) MAX_TILEY--;
+		else if ((kDown & VPAD_BUTTON_RIGHT) && (MAX_TILEX < 19)) MAX_TILEX++;
+		else if ((kDown & VPAD_BUTTON_LEFT) && (MAX_TILEX > 2)) MAX_TILEX--;
+		else if ((kDown & VPAD_BUTTON_R) && (total_mines < MAX_TILEX*MAX_TILEY-1)) total_mines++;
+		else if ((kDown & VPAD_BUTTON_L) && (total_mines > 1)) total_mines--;
 		else if (custom_wait_touch)
 		{
-			if (!(kHeld & KEY_TOUCH))
+			if (!(StylusState & STYLUS_HELD))
 			{
 				custom_wait_touch = false;
 			}
 		}
-		else if ((kHeld & KEY_TOUCH) && inBox(Stylus, 460, 189, 823, 219))
+		else if ((StylusState & STYLUS_HELD) && inBox(Stylus, 460, 189, 823, 219))
 		{
-			MAX_TILEY = (Stylus.px - 460)/30 + 2;
+			MAX_TILEY = (Stylus.x - 460)/30 + 2;
 		}
-		else if ((kHeld & KEY_TOUCH) && inBox(Stylus, 385, 369, 898, 399))
+		else if ((StylusState & STYLUS_HELD) && inBox(Stylus, 385, 369, 898, 399))
 		{
-			MAX_TILEX = (Stylus.px - 385)/30 + 2;
+			MAX_TILEX = (Stylus.x - 385)/30 + 2;
 		}
-		else if ((kHeld & KEY_TOUCH) && inBox(Stylus, 244, 549, 1042, 579))
+		else if ((StylusState & STYLUS_HELD) && inBox(Stylus, 244, 549, 1042, 579))
 		{
-			total_mines = (Stylus.px - 244)/3;
+			total_mines = (Stylus.x - 244)/3;
 		}
 
-		else if (((kDown & KEY_TOUCH) && inBox(Stylus, 1146, 638, 1280, 720)) || kDown & KEY_A)
+		else if (((StylusState & STYLUS_HELD) && inBox(Stylus, 1146, 638, 1280, 720)) || kDown & VPAD_BUTTON_A)
 		{
 			mode_game = true;
 			mode_custom = false;
@@ -845,7 +869,6 @@ int main()
 {
 	SDL_Init(SDL_INIT_EVERYTHING);
 	IMG_Init(IMG_INIT_PNG);
-	romfsInit();
 
 	srand(time(0));
 
@@ -876,11 +899,11 @@ int main()
 
 	if (save)
 	{
-		fread(highscore, sizeof(u16), 3, save);
-		fread(&customX, sizeof(u8), 1, save);
-		fread(&customY, sizeof(u8), 1, save);
+		fread(highscore, sizeof(uint16_t), 3, save);
+		fread(&customX, sizeof(uint8_t), 1, save);
+		fread(&customY, sizeof(uint8_t), 1, save);
 		fread(&customM, sizeof(int), 1, save);
-		fread(&selector, sizeof(u8), 1, save);
+		fread(&selector, sizeof(uint8_t), 1, save);
 		fclose(save);
 	}
 
@@ -892,46 +915,27 @@ int main()
     	renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
 
 	//BG
-	surface = IMG_Load("romfs:/resources/BG_BOTTOM_MENU.png");
-	background[0].texture = SDL_CreateTextureFromSurface(renderer, surface);
-	SDL_FreeSurface(surface);
+	background[0].texture = LoadImageTexture(RES_DATA(BG_BOTTOM_MENU,png), RES_SIZE(BG_BOTTOM_MENU,png));
 
-	surface = IMG_Load("romfs:/resources/BG_BOTTOM_GAME.png");
-	background[2].texture = SDL_CreateTextureFromSurface(renderer, surface);
-	SDL_FreeSurface(surface);
+	background[2].texture = LoadImageTexture(RES_DATA(BG_BOTTOM_GAME,png), RES_SIZE(BG_BOTTOM_GAME,png));
 
-	surface = IMG_Load("romfs:/resources/BG_BOTTOM_CUSTOM.png");
-	background[4].texture = SDL_CreateTextureFromSurface(renderer, surface);
-	SDL_FreeSurface(surface);
+	background[4].texture = LoadImageTexture(RES_DATA(BG_BOTTOM_CUSTOM,png), RES_SIZE(BG_BOTTOM_CUSTOM,png));
 
 	//Sprite
-	surface = IMG_Load("romfs:/resources/SELECTOR.png");
-	sprite[0].texture = SDL_CreateTextureFromSurface(renderer, surface);
-	SDL_FreeSurface(surface);
-	
-	surface = IMG_Load("romfs:/resources/CURSOR.png");
-	sprite[1].texture = SDL_CreateTextureFromSurface(renderer, surface);
-	SDL_FreeSurface(surface);
+	sprite[0].texture = LoadImageTexture(RES_DATA(SELECTOR,png), RES_SIZE(SELECTOR,png));
+	sprite[1].texture = LoadImageTexture(RES_DATA(CURSOR,png), RES_SIZE(CURSOR,png));
 
 	//Emoticon
-	surface = IMG_Load("romfs:/resources/EMOTICONS.png");
-	smiley.texture = SDL_CreateTextureFromSurface(renderer, surface);
-	SDL_FreeSurface(surface);
+	smiley.texture = LoadImageTexture(RES_DATA(EMOTICONS,png), RES_SIZE(EMOTICONS,png));
 
 	//Nombre
-	surface = IMG_Load("romfs:/resources/NUMBERS.png");
-	chiffre.texture = SDL_CreateTextureFromSurface(renderer, surface);
-	SDL_FreeSurface(surface);
+	chiffre.texture = LoadImageTexture(RES_DATA(NUMBERS,png), RES_SIZE(NUMBERS,png));
 
 	//Number
-	surface = IMG_Load("romfs:/resources/NUMBER.png");
-	number.texture = SDL_CreateTextureFromSurface(renderer, surface);
-	SDL_FreeSurface(surface);
+	number.texture = LoadImageTexture(RES_DATA(NUMBER,png), RES_SIZE(NUMBER,png));
 
 	//Tiles
-	surface = IMG_Load("romfs:/resources/TILES.png");
-	tile.texture = SDL_CreateTextureFromSurface(renderer, surface);
-	SDL_FreeSurface(surface);
+	tile.texture = LoadImageTexture(RES_DATA(TILES,png), RES_SIZE(TILES,png));
 
 	mode_custom = false;
 	mode_game = false;
@@ -942,17 +946,34 @@ int main()
 	MAX_TILEY = 2;
 	total_mines = 1;
 
-	while (appletMainLoop())
+	while (WHBProcIsRunning())
 	{
-		hidScanInput();
+		VPADStatus vpad;
+		VPADReadError vpaderr;
+		VPADRead(VPAD_CHAN_0, &vpad, 1, &vpaderr);
+		if (vpaderr == VPAD_READ_SUCCESS)
+		{
+			kDown = vpad.trigger;
+			kHeld = vpad.hold;
+			kUp = vpad.release;
+			VPADGetTPCalibratedPoint(VPAD_CHAN_0, &Stylus, &vpad.tpFiltered1);
+			if (Stylus.touched) {
+				if (StylusState & STYLUS_DOWN) {
+					StylusState &= ~STYLUS_DOWN;
+				} else if (!(StylusState & STYLUS_HELD)) {
+					StylusState |= STYLUS_HELD;
+					StylusState |= STYLUS_DOWN;
+				}
+			} else {
+				if (StylusState & STYLUS_UP) {
+					StylusState &= ~STYLUS_UP;
+				} else if (StylusState != 0) {
+					StylusState = STYLUS_UP;
+				}
+			}
+		}
 
-		kDown = hidKeysDown(CONTROLLER_P1_AUTO);
-		kHeld = hidKeysHeld(CONTROLLER_P1_AUTO);
-		kUp = hidKeysUp(CONTROLLER_P1_AUTO);
-
-		hidTouchRead(&Stylus, 0);
-
-		if (kDown & KEY_PLUS) break;
+		if (kDown & VPAD_BUTTON_PLUS) break;
 
 		if (!game_over && game)
 		{
@@ -987,11 +1008,11 @@ int main()
 		FILE* save = fopen(filename, "wb");
 		if (save)
 		{
-			fwrite(highscore, sizeof(u16), 3, save);
-			fwrite(&customX,  sizeof(u8),  1, save);
-			fwrite(&customY,  sizeof(u8),  1, save);
+			fwrite(highscore, sizeof(uint16_t), 3, save);
+			fwrite(&customX,  sizeof(uint8_t),  1, save);
+			fwrite(&customY,  sizeof(uint8_t),  1, save);
 			fwrite(&customM,  sizeof(int), 1, save);
-			fwrite(&selector, sizeof(u8),  1, save);
+			fwrite(&selector, sizeof(uint8_t),  1, save);
 			fclose(save);
 		}
 	}
