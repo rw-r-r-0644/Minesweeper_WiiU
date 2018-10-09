@@ -13,6 +13,8 @@
 
 #include <vpad/input.h>
 
+#include <romfs-wiiu.h>
+
 #define TILE_SIZEX 48
 #define TILE_SIZEY 48
 
